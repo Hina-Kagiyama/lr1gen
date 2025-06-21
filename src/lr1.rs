@@ -1,5 +1,6 @@
+use itertools::merge;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, hash_map::Entry},
     fmt::Display,
     hash::Hash,
     ops::Add,
@@ -13,8 +14,6 @@ pub enum Symbol<Terminal, NonTerminal> {
     Terminal(Terminal),
     NonTerminal(NonTerminal),
     Epsilon,
-    Eof,
-    Start,
 }
 
 impl<Terminal: Display, NonTerminal: Display> Display for Symbol<Terminal, NonTerminal> {
@@ -23,8 +22,6 @@ impl<Terminal: Display, NonTerminal: Display> Display for Symbol<Terminal, NonTe
             Symbol::Terminal(x) => write!(f, "\"{x}\""),
             Symbol::NonTerminal(x) => write!(f, "{x}"),
             Symbol::Epsilon => write!(f, "<<eps>>"),
-            Symbol::Eof => write!(f, "<<eof>>"),
-            Symbol::Start => write!(f, "<<start>>"),
         }
     }
 }
@@ -39,6 +36,24 @@ pub struct Grammar<Terminal, NonTerminal> {
     productions: HashMap<NonTerminalId, Vec<Rhs<TerminalId, NonTerminalId>>>,
     terminals: Vec<Terminal>,
     nonterminals: Vec<NonTerminal>,
+}
+
+impl<Terminal, NonTerminal: Clone> Grammar<Terminal, NonTerminal> {
+    pub fn check_undefined_nonterminals(&self) -> Vec<NonTerminal> {
+        // mark-table: used[i] == true  ⇔  nonterminal i occurs in some production
+        let mut defined = vec![false; self.nonterminals.len()];
+
+        // walk every RHS once
+        self.productions
+            .keys()
+            .for_each(|&ntid| defined[ntid] = true);
+
+        defined
+            .iter()
+            .enumerate()
+            .filter_map(|(ntid, def)| (!def).then_some(self.nonterminals[ntid].clone()))
+            .collect_vec()
+    }
 }
 
 impl<Terminal: Display, NonTerminal: Display> Display for Grammar<Terminal, NonTerminal> {
@@ -142,8 +157,6 @@ impl<Terminal: Eq + Clone, NonTerminal: Eq + Hash + Clone> Add<RuleBuilder<Termi
                             }
                         }
                         Symbol::Epsilon => Symbol::Epsilon,
-                        Symbol::Eof => Symbol::Eof,
-                        Symbol::Start => Symbol::Start,
                     })
                     .collect_vec()
             })
@@ -153,9 +166,22 @@ impl<Terminal: Eq + Clone, NonTerminal: Eq + Hash + Clone> Add<RuleBuilder<Termi
     }
 }
 
-impl<Terminal, NonTerminal: Eq + Hash> GrammarBuilder<Terminal, NonTerminal> {
-    pub fn build(self) -> Grammar<Terminal, NonTerminal> {
-        self.grammar
+#[derive(Debug, Clone)]
+pub enum GrammarCheckFailed<Terminal, NonTerminal> {
+    BadTerminals(Vec<Terminal>),
+    UndefinedNonterminals(Vec<NonTerminal>),
+}
+
+impl<Terminal, NonTerminal: Clone + Eq + Hash> GrammarBuilder<Terminal, NonTerminal> {
+    pub fn build(
+        self,
+    ) -> Result<Grammar<Terminal, NonTerminal>, GrammarCheckFailed<Terminal, NonTerminal>> {
+        let undefined_nt = self.grammar.check_undefined_nonterminals();
+        if undefined_nt.len() == 0 {
+            Ok(self.grammar)
+        } else {
+            Err(GrammarCheckFailed::UndefinedNonterminals(undefined_nt))
+        }
     }
 }
 
@@ -182,44 +208,474 @@ pub fn n<Terminal, NonTerminal, N: Into<NonTerminal>>(n: N) -> Symbol<Terminal, 
     Symbol::NonTerminal(n.into())
 }
 
-pub struct ProductionRef<'grammar, Terminal, NonTerminal> {
-    lhs: &'grammar NonTerminal,
-    rhs: &'grammar Rhs<Terminal, NonTerminal>,
-}
+pub type RhsId = usize;
+pub type ProductionId = (NonTerminalId, RhsId);
 
-pub struct Item<'grammar, Terminal, NonTerminal> {
-    production_ref: ProductionRef<'grammar, Terminal, NonTerminal>,
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Item {
+    production: ProductionId,
     dot_position: usize,
-    lookhead: &'grammar Terminal,
+    lookhead: TerminalId,
 }
 
 pub type StateId = usize;
 
-pub enum Action<'grammar, Terminal, NonTerminal> {
+pub enum Action {
     Shift(StateId),
-    Reduce(ProductionRef<'grammar, Terminal, NonTerminal>),
+    Reduce(ProductionId),
     Accept,
     Error,
 }
 
-pub struct State<'grammar, Terminal, NonTerminal> {
-    items: Vec<Item<'grammar, Terminal, NonTerminal>>,
-    action: HashMap<Terminal, Action<'grammar, Terminal, NonTerminal>>,
-    goto: HashMap<NonTerminal, StateId>,
+pub struct State {
+    items: Vec<Item>,
+    action: HashMap<TerminalId, Action>,
+    goto: HashMap<NonTerminalId, StateId>,
 }
 
 pub struct Table<'grammar, Terminal, NonTerminal> {
     grammar: &'grammar Grammar<Terminal, NonTerminal>,
     // start state at index 0
-    states: Vec<State<'grammar, Terminal, NonTerminal>>,
+    states: Vec<State>,
 }
 
-pub type FirstSets<Terminal, NonTerminal> = HashMap<Symbol<Terminal, NonTerminal>, Vec<Terminal>>;
+impl<'grammar, Terminal, NonTerminal> Display for Table<'grammar, Terminal, NonTerminal>
+where
+    Terminal: Display,
+    NonTerminal: Display,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        //------------------------------------------------------------------
+        // helpers
+        //------------------------------------------------------------------
+        let sym_to_string = |sym: &Symbol<TerminalId, NonTerminalId>| -> String {
+            match *sym {
+                Symbol::Terminal(t) => format!("{}", self.grammar.terminals[t]),
+                Symbol::NonTerminal(nt) => format!("{}", self.grammar.nonterminals[nt]),
+                Symbol::Epsilon => "ε".into(),
+            }
+        };
 
-// fn compute_first_sets<'grammar, Terminal, NonTerminal>(
-//     grammar: &'grammar Grammar<Terminal, NonTerminal>,
-// ) -> FirstSets<Terminal, NonTerminal> {
-//     let mut first = HashMap::new();
-//
-//     todo!()
-// }
+        let item_to_string = |item: &Item| -> String {
+            let (lhs, rhs_id) = item.production;
+            let rhs = &self.grammar.productions[&lhs][rhs_id];
+            let lhs_str = format!("{}", self.grammar.nonterminals[lhs]);
+
+            // RHS with the • at `dot_position`
+            let mut rhs_repr: Vec<String> = rhs
+                .iter()
+                .enumerate()
+                .flat_map(|(i, sym)| {
+                    if i == item.dot_position {
+                        vec!["•".into(), sym_to_string(sym)]
+                    } else {
+                        vec![sym_to_string(sym)]
+                    }
+                })
+                .collect();
+
+            // dot at the very end?
+            if item.dot_position == rhs.len() {
+                rhs_repr.push("•".into());
+            }
+
+            format!(
+                "{} → {} , {}",
+                lhs_str,
+                rhs_repr.join(" "),
+                self.grammar.terminals[item.lookhead] // look-ahead
+            )
+        };
+
+        let action_to_string = |act: &Action| -> String {
+            match *act {
+                Action::Shift(sid) => format!("Shift({})", sid),
+                Action::Reduce((lhs, rid)) => format!(
+                    "Reduce({} → {})",
+                    self.grammar.nonterminals[lhs],
+                    self.grammar.productions[&lhs][rid]
+                        .iter()
+                        .map(&sym_to_string)
+                        .join(" ")
+                ),
+                Action::Accept => "Accept".into(),
+                Action::Error => "Error".into(),
+            }
+        };
+        //------------------------------------------------------------------
+
+        writeln!(f, "LR(1) Table — {} states\n", self.states.len())?;
+
+        for (sid, state) in self.states.iter().enumerate() {
+            writeln!(f, "State {}:", sid)?;
+
+            // items
+            if f.alternate() {
+                for item in &state.items {
+                    writeln!(f, "    {}", item_to_string(item))?;
+                }
+            }
+
+            // ACTIONS
+            if !state.action.is_empty() {
+                writeln!(f, "  Actions:")?;
+                let mut acts: Vec<_> = state.action.iter().collect();
+                acts.sort_by_key(|(tid, _)| *tid);
+                for (&tid, act) in acts {
+                    writeln!(
+                        f,
+                        "    {:>10}  →  {}",
+                        self.grammar.terminals[tid],
+                        action_to_string(act)
+                    )?;
+                }
+            }
+
+            // GOTOS
+            if !state.goto.is_empty() {
+                writeln!(f, "  Gotos:")?;
+                let mut gts: Vec<_> = state.goto.iter().collect();
+                gts.sort_by_key(|(ntid, _)| *ntid);
+                for (&ntid, &dst) in gts {
+                    writeln!(f, "    {:>10}  →  {}", self.grammar.nonterminals[ntid], dst)?;
+                }
+            }
+
+            writeln!(f)?; // blank line between states
+        }
+        Ok(())
+    }
+}
+
+impl<'grammar, Terminal, NonTerminal> Table<'grammar, Terminal, NonTerminal> {
+    pub fn make(grammar: &'grammar Grammar<Terminal, NonTerminal>) -> Self {
+        let mut states = Vec::new();
+
+        // ---- helper aliases & imports ------------------------------------
+        use itertools::{Itertools, merge};
+        use std::collections::{HashMap, HashSet};
+
+        // ---- FIRST / NULLABLE --------------------------------------------
+        let first_sets = FirstSets::make(grammar);
+
+        /* FIRST(β a) where a is the lookahead ---------------------------- */
+        // FIRST(β · a)
+        let first_beta_a =
+            |beta: &[Symbol<TerminalId, NonTerminalId>], a: TerminalId| -> Vec<TerminalId> {
+                let mut out = Vec::<TerminalId>::new();
+                let mut still_nullable = true;
+
+                for sym in beta {
+                    if !still_nullable {
+                        break; // prefix no longer nullable
+                    }
+
+                    match *sym {
+                        Symbol::Terminal(t) => {
+                            out.push(t);
+                            still_nullable = false; // terminal blocks ε
+                        }
+                        Symbol::NonTerminal(_nt) => {
+                            // union(out, FIRST(B))
+                            out = merge(out.into_iter(), first_sets.first(sym).into_iter())
+                                .dedup()
+                                .collect();
+                            still_nullable = first_sets.nullable(sym);
+                        }
+                        Symbol::Epsilon => { /* keep scanning */ }
+                    }
+                }
+
+                if still_nullable {
+                    out.push(a); // ε ⇒ add the look-ahead
+                }
+                out.sort_unstable();
+                out.dedup();
+                out
+            };
+
+        // ---- CLOSURE(I) ---------------------------------------------------
+        let closure = |mut i: HashSet<Item>| -> HashSet<Item> {
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for it in i.clone() {
+                    // A → α ·B β , a
+                    let (lhs, rhs_id) = it.production;
+                    let rhs = &grammar.productions[&lhs][rhs_id];
+                    if it.dot_position >= rhs.len() {
+                        continue;
+                    }
+                    if let Symbol::NonTerminal(b) = rhs[it.dot_position] {
+                        let beta = &rhs[it.dot_position + 1..];
+                        let looks = first_beta_a(beta, it.lookhead);
+                        for (k, _gamma) in grammar.productions[&b].iter().enumerate() {
+                            looks.iter().for_each(|&t| {
+                                let itm = Item {
+                                    production: (b, k),
+                                    dot_position: 0,
+                                    lookhead: t,
+                                };
+                                if i.insert(itm) {
+                                    changed = true;
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+            i
+        };
+
+        // ---- GOTO(I, X) ---------------------------------------------------
+        let goto = |i: &HashSet<Item>, x: &Symbol<TerminalId, NonTerminalId>| -> HashSet<Item> {
+            closure(
+                i.iter()
+                    .filter_map(|it| {
+                        let (lhs, rhs_id) = it.production;
+                        let rhs = &grammar.productions[&lhs][rhs_id];
+                        (it.dot_position < rhs.len() && &rhs[it.dot_position] == x).then(|| Item {
+                            production: it.production,
+                            dot_position: it.dot_position + 1,
+                            lookhead: it.lookhead,
+                        })
+                    })
+                    .collect(),
+            )
+        };
+
+        // ---- build the canonical LR(1) collection of sets ----------------
+        let start_nt: NonTerminalId = 0; // assume the first NT is the start
+        let eof: TerminalId = grammar.terminals.len() - 1; // assume last terminal is $
+
+        let i0 = closure(HashSet::from([Item {
+            production: (start_nt, 0),
+            dot_position: 0,
+            lookhead: eof,
+        }]));
+
+        /* state registry so we only create each set once ----------------- */
+        fn canon(set: &HashSet<Item>) -> Vec<Item> {
+            let mut v: Vec<_> = set.iter().cloned().collect();
+            // A stable total ordering: (A, i, dot, lookahead)
+            v.sort_by_key(|it| {
+                (
+                    it.production.0,
+                    it.production.1,
+                    it.dot_position,
+                    it.lookhead,
+                )
+            });
+            v
+        }
+        let mut set2id: HashMap<Vec<Item>, StateId> = HashMap::from([(canon(&i0), 0)]);
+        let mut worklist = vec![i0];
+        states.push(State {
+            items: Vec::new(),
+            action: HashMap::new(),
+            goto: HashMap::new(),
+        });
+
+        while let Some(iset) = worklist.pop() {
+            let sid = set2id[&canon(&iset)];
+
+            // ensure the Vec<State> is big enough
+            if states.len() <= sid {
+                states.resize_with(sid + 1, || State {
+                    items: Vec::new(),
+                    action: HashMap::new(),
+                    goto: HashMap::new(),
+                });
+            }
+            states[sid].items = iset.iter().cloned().collect();
+
+            // partition symbols after dots into terminals / non-terminals
+            let (terms, nterms): (HashSet<_>, HashSet<_>) = iset
+                .iter()
+                .filter_map(|it| {
+                    let (lhs, rhs_id) = it.production;
+                    let rhs = &grammar.productions[&lhs][rhs_id];
+                    (it.dot_position < rhs.len()).then(|| &rhs[it.dot_position])
+                })
+                .fold(
+                    (HashSet::new(), HashSet::new()),
+                    |(mut ts, mut nts), sym| {
+                        match *sym {
+                            Symbol::Terminal(t) => {
+                                ts.insert(t);
+                            }
+                            Symbol::NonTerminal(nt) => {
+                                nts.insert(nt);
+                            }
+                            Symbol::Epsilon => {}
+                        }
+                        (ts, nts)
+                    },
+                );
+
+            /* ------- shifts & gotos ------------------------------------- */
+            terms.into_iter().for_each(|t| {
+                let nxt = goto(&iset, &Symbol::Terminal(t));
+                if nxt.is_empty() {
+                    return;
+                }
+                let key = canon(&nxt);
+                let tgt = match set2id.entry(key) {
+                    Entry::Occupied(e) => *e.get(), // state already known
+                    Entry::Vacant(v) => {
+                        let id = states.len(); // next free StateId
+                        v.insert(id); // record in the map
+                        worklist.push(nxt); // schedule for expansion
+                        states.push(State {
+                            // make the placeholder
+                            items: Vec::new(),
+                            action: HashMap::new(),
+                            goto: HashMap::new(),
+                        });
+                        id
+                    }
+                };
+                states[sid].action.insert(t, Action::Shift(tgt));
+            });
+
+            nterms.into_iter().for_each(|nt| {
+                let nxt = goto(&iset, &Symbol::NonTerminal(nt));
+                if nxt.is_empty() {
+                    return;
+                }
+                let key = canon(&nxt);
+                let tgt = match set2id.entry(key) {
+                    Entry::Occupied(e) => *e.get(), // state already known
+                    Entry::Vacant(v) => {
+                        let id = states.len(); // next free StateId
+                        v.insert(id); // record in the map
+                        worklist.push(nxt); // schedule for expansion
+                        states.push(State {
+                            // make the placeholder
+                            items: Vec::new(),
+                            action: HashMap::new(),
+                            goto: HashMap::new(),
+                        });
+                        id
+                    }
+                };
+                states[sid].goto.insert(nt, tgt);
+            });
+
+            /* ------- reduces / accept ------------------------------------ */
+            iset.iter().for_each(|it| {
+                let (lhs, rhs_id) = it.production;
+                let rhs = &grammar.productions[&lhs][rhs_id];
+                if it.dot_position == rhs.len() {
+                    if lhs == start_nt && rhs_id == 0 && it.lookhead == eof {
+                        states[sid].action.insert(it.lookhead, Action::Accept);
+                    } else {
+                        states[sid]
+                            .action
+                            .insert(it.lookhead, Action::Reduce(it.production));
+                    }
+                }
+            });
+        }
+
+        Self { grammar, states }
+    }
+}
+
+#[derive(Debug)]
+pub struct FirstSets<'grammar, Terminal, NonTerminal> {
+    nonterminal_first_sets: Vec<Vec<TerminalId>>,
+    nonterminal_nullable: Vec<bool>,
+    grammar: &'grammar Grammar<Terminal, NonTerminal>,
+}
+
+impl<'grammar, Terminal, NonTerminal> FirstSets<'grammar, Terminal, NonTerminal> {
+    pub fn make(grammar: &'grammar Grammar<Terminal, NonTerminal>) -> Self {
+        /* ---- initialise -------------------------------------------------- */
+        let n = grammar.nonterminals.len();
+        let mut nonterminal_first_sets: Vec<Vec<TerminalId>> = vec![Vec::new(); n];
+        let mut nonterminal_nullable: Vec<bool> = vec![false; n];
+
+        /* ---- small helper: A ∪= B --------------------------------------- */
+        fn union<I, J>(lhs: I, rhs: J) -> Vec<usize>
+        where
+            I: Iterator<Item = TerminalId>,
+            J: Iterator<Item = TerminalId>,
+        {
+            merge(lhs, rhs).dedup().collect_vec()
+        }
+
+        // -------- fixed-point computation (iterator-centric style) ---------
+        let mut changed = true;
+        while changed {
+            changed = false;
+
+            grammar.productions.iter().for_each(|(&lhs, rhss)| {
+                rhss.iter().for_each(|rhs| {
+                    // FIRST(rhs) and ε-nullability in one fold
+                    let (rhs_first, rhs_nullable) = rhs.iter().fold(
+                        (Vec::<TerminalId>::new(), true),
+                        |(mut acc, still_nullable), sym| {
+                            if !still_nullable {
+                                // once we hit a non-nullable symbol we can stop
+                                return (acc, false);
+                            }
+                            match *sym {
+                                Symbol::Terminal(t) => {
+                                    acc.push(t);
+                                    (acc, false)
+                                }
+                                Symbol::NonTerminal(nt) => {
+                                    acc = union(
+                                        acc.into_iter(),
+                                        nonterminal_first_sets[nt].iter().cloned(),
+                                    );
+                                    (acc, nonterminal_nullable[nt])
+                                }
+                                Symbol::Epsilon => (acc, true),
+                            }
+                        },
+                    );
+
+                    // propagate FIRST(rhs) to FIRST(lhs)
+                    let new_first = union(
+                        nonterminal_first_sets[lhs].iter().cloned(),
+                        rhs_first.into_iter(),
+                    );
+                    if new_first != nonterminal_first_sets[lhs] {
+                        nonterminal_first_sets[lhs] = new_first;
+                        changed = true;
+                    }
+
+                    // propagate nullability
+                    if rhs_nullable && !nonterminal_nullable[lhs] {
+                        nonterminal_nullable[lhs] = true;
+                        changed = true;
+                    }
+                });
+            });
+        }
+
+        Self {
+            nonterminal_first_sets,
+            nonterminal_nullable,
+            grammar,
+        }
+    }
+
+    pub fn first(&self, sym: &Symbol<TerminalId, NonTerminalId>) -> Vec<TerminalId> {
+        match *sym {
+            Symbol::Terminal(i) => vec![i],
+            Symbol::NonTerminal(i) => self.nonterminal_first_sets[i].clone(),
+            Symbol::Epsilon => vec![], // just make things simpler
+        }
+    }
+
+    pub fn nullable(&self, sym: &Symbol<TerminalId, NonTerminalId>) -> bool {
+        match *sym {
+            Symbol::Terminal(_) => false,
+            Symbol::NonTerminal(i) => self.nonterminal_nullable[i],
+            Symbol::Epsilon => true, // just make things simpler
+        }
+    }
+}

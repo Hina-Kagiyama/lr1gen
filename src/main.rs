@@ -1,6 +1,7 @@
-use lr1gen::lr1::{grammar, n, rule, t};
+use lr1gen::lr1::{Table, grammar, n, rule, t};
 
-fn main() {
+#[allow(dead_code)]
+fn test1() {
     // primExp:
     //   ( exp )
     //   id
@@ -33,11 +34,56 @@ fn main() {
                 vec![t("let"), t("id"), t("="), n("absExp"), t(";"), n("letExp")],
             ],
         )
+        + rule("exp", [vec![n("letExp")]])
         + rule(
             "prog",
             [vec![n("letExp")], vec![n("prog"), t(";"), n("letExp")]],
         );
-    let grm = grm.build();
+    let grm = grm.build().unwrap();
 
-    println!("{grm}")
+    println!("{grm}");
+    println!("{}", Table::make(&grm));
+}
+
+#[allow(dead_code)]
+fn test2() {
+    // expr   ::= addExp
+    // addExp ::= mulExp
+    //          | addExp + mulExp
+    //          | addExp - mulExp
+    // mulExp ::= primExp
+    //          | mulExp * primExp
+    //          | mulExp / primExp
+    // primExp ::= ( expr )
+    //           | num      // literal “num” token
+
+    let grm = grammar::<&str, &str>("expr")
+        + rule("primExp", [vec![t("("), n("expr"), t(")")], vec![t("num")]])
+        + rule(
+            "mulExp",
+            [
+                vec![n("primExp")],
+                vec![n("mulExp"), t("*"), n("primExp")],
+                vec![n("mulExp"), t("/"), n("primExp")],
+            ],
+        )
+        + rule(
+            "addExp",
+            [
+                vec![n("mulExp")],
+                vec![n("addExp"), t("+"), n("mulExp")],
+                vec![n("addExp"), t("-"), n("mulExp")],
+            ],
+        )
+        + rule("expr", [vec![n("addExp"), t("$")]]);
+
+    let grm = grm.build().unwrap();
+
+    println!("{grm}");
+    println!("{}", Table::make(&grm));
+}
+
+fn main() {
+    // test1()
+    test2();
 }
