@@ -3,7 +3,8 @@ use std::{
     collections::{HashMap, hash_map::Entry},
     fmt::Display,
     hash::Hash,
-    ops::Add,
+    iter::{Peekable, repeat_with},
+    ops::{Add, ControlFlow},
     usize,
 };
 
@@ -54,6 +55,16 @@ impl<Terminal, NonTerminal: Clone> Grammar<Terminal, NonTerminal> {
             .filter_map(|(ntid, def)| (!def).then_some(self.nonterminals[ntid].clone()))
             .collect_vec()
     }
+
+    pub fn check_unterminated_start_rule(&self) -> bool {
+        self.productions[&0]
+            .iter()
+            .map(|x| match x.last() {
+                Some(Symbol::Terminal(0)) => false,
+                _ => true,
+            })
+            .fold(false, |a, b| a || b)
+    }
 }
 
 impl<Terminal: Display, NonTerminal: Display> Display for Grammar<Terminal, NonTerminal> {
@@ -103,11 +114,14 @@ pub struct GrammarBuilder<Terminal, NonTerminal> {
     grammar: Grammar<Terminal, NonTerminal>,
 }
 
-pub fn grammar<Terminal, NonTerminal>(start: NonTerminal) -> GrammarBuilder<Terminal, NonTerminal> {
+pub fn grammar<Terminal, NonTerminal>(
+    start: NonTerminal,
+    end: Terminal,
+) -> GrammarBuilder<Terminal, NonTerminal> {
     GrammarBuilder {
         grammar: Grammar {
             productions: HashMap::new(),
-            terminals: Vec::new(),
+            terminals: vec![end],
             nonterminals: vec![start],
         },
     }
@@ -167,20 +181,20 @@ impl<Terminal: Eq + Clone, NonTerminal: Eq + Hash + Clone> Add<RuleBuilder<Termi
 }
 
 #[derive(Debug, Clone)]
-pub enum GrammarCheckFailed<Terminal, NonTerminal> {
-    BadTerminals(Vec<Terminal>),
+pub enum GrammarCheckFailed<NonTerminal> {
+    UnterminatedStartRule,
     UndefinedNonterminals(Vec<NonTerminal>),
 }
 
 impl<Terminal, NonTerminal: Clone + Eq + Hash> GrammarBuilder<Terminal, NonTerminal> {
-    pub fn build(
-        self,
-    ) -> Result<Grammar<Terminal, NonTerminal>, GrammarCheckFailed<Terminal, NonTerminal>> {
+    pub fn build(self) -> Result<Grammar<Terminal, NonTerminal>, GrammarCheckFailed<NonTerminal>> {
         let undefined_nt = self.grammar.check_undefined_nonterminals();
-        if undefined_nt.len() == 0 {
-            Ok(self.grammar)
-        } else {
+        if undefined_nt.len() != 0 {
             Err(GrammarCheckFailed::UndefinedNonterminals(undefined_nt))
+        } else if self.grammar.check_unterminated_start_rule() {
+            Err(GrammarCheckFailed::UnterminatedStartRule)
+        } else {
+            Ok(self.grammar)
         }
     }
 }
@@ -223,7 +237,6 @@ pub type StateId = usize;
 pub enum Action {
     Shift(StateId),
     Reduce(ProductionId),
-    Accept,
     Error,
 }
 
@@ -237,6 +250,107 @@ pub struct Table<'grammar, Terminal, NonTerminal> {
     grammar: &'grammar Grammar<Terminal, NonTerminal>,
     // start state at index 0
     states: Vec<State>,
+}
+
+#[derive(Debug, Clone)]
+pub enum AbSyn<'input, Terminal> {
+    Datum(&'input Terminal),
+    List(NonTerminalId, Vec<AbSyn<'input, Terminal>>),
+}
+
+#[derive(Debug, Clone)]
+pub struct Env<'input, Terminal, I>
+where
+    I: Iterator<Item = &'input Terminal>,
+{
+    states: Vec<StateId>,
+    peekable_terminal_iter: Peekable<I>,
+    value_stack: Vec<AbSyn<'input, Terminal>>,
+}
+
+impl<'input, Terminal, I> Env<'input, Terminal, I>
+where
+    I: Iterator<Item = &'input Terminal>,
+{
+    pub fn new(peekable_terminal_iter: Peekable<I>) -> Self {
+        Self {
+            states: vec![0],
+            peekable_terminal_iter,
+            value_stack: vec![],
+        }
+    }
+}
+
+pub fn interpret<
+    'input,
+    'grammar,
+    Terminal: Eq,
+    NonTerminal: Eq,
+    I: Iterator<Item = &'input Terminal>,
+>(
+    mut env: Env<'input, Terminal, I>,
+    table: &'grammar Table<'grammar, Terminal, NonTerminal>,
+) -> ControlFlow<Result<AbSyn<'input, Terminal>, Env<'input, Terminal, I>>, Env<'input, Terminal, I>>
+{
+    let &cur_state_id = env.states.last().unwrap();
+    let lookahead_id = env
+        .peekable_terminal_iter
+        .peek()
+        .map(|&x| {
+            table
+                .grammar
+                .terminals
+                .iter()
+                .position(|t| x == t)
+                .expect("Unknown Terminal")
+        })
+        .unwrap_or(0);
+    let action = table.states[cur_state_id]
+        .action
+        .get(&lookahead_id)
+        .unwrap_or(&Action::Error);
+
+    match *action {
+        Action::Shift(next_state_id) => {
+            let tok_ref: &'input Terminal = env
+                .peekable_terminal_iter
+                .next()
+                .expect("No token to shift");
+            env.value_stack.push(AbSyn::Datum(tok_ref));
+            env.states.push(next_state_id);
+            ControlFlow::Continue(env)
+        }
+        Action::Reduce((lhs_id, rhs_id)) => {
+            let rhs = &table.grammar.productions[&lhs_id][rhs_id];
+            let k = rhs.len();
+            let children = repeat_with(|| env.value_stack.pop().expect("stack balance error"))
+                .take(k)
+                .collect_vec()
+                .into_iter()
+                .rev()
+                .collect_vec();
+
+            let lhs = &table.grammar.nonterminals[lhs_id];
+            let lhs_id = table
+                .grammar
+                .nonterminals
+                .iter()
+                .position(|x| x == lhs)
+                .expect("Bad NonTerminal");
+            env.value_stack.push(AbSyn::List(lhs_id, children));
+
+            for _ in 0..k {
+                env.states.pop();
+            }
+            if let Some(&ready_go) = env.states.last() {
+                env.states.push(table.states[ready_go].goto[&lhs_id]);
+                ControlFlow::Continue(env)
+            } else {
+                ControlFlow::Break(Ok(env.value_stack.pop().expect("Stack balance error")))
+            }
+        }
+        Action::Error => ControlFlow::Break(Err(env)),
+    }
 }
 
 impl<'grammar, Terminal, NonTerminal> Display for Table<'grammar, Terminal, NonTerminal>
@@ -298,7 +412,6 @@ where
                         .map(&sym_to_string)
                         .join(" ")
                 ),
-                Action::Accept => "Accept".into(),
                 Action::Error => "Error".into(),
             }
         };
@@ -567,13 +680,13 @@ impl<'grammar, Terminal, NonTerminal> Table<'grammar, Terminal, NonTerminal> {
                 let (lhs, rhs_id) = it.production;
                 let rhs = &grammar.productions[&lhs][rhs_id];
                 if it.dot_position == rhs.len() {
-                    if lhs == start_nt && rhs_id == 0 && it.lookhead == eof {
-                        states[sid].action.insert(it.lookhead, Action::Accept);
-                    } else {
-                        states[sid]
-                            .action
-                            .insert(it.lookhead, Action::Reduce(it.production));
-                    }
+                    // if lhs == start_nt && rhs_id == 0 && it.lookhead == eof {
+                    //     states[sid].action.insert(it.lookhead, Action::Accept);
+                    // } else {
+                    states[sid]
+                        .action
+                        .insert(it.lookhead, Action::Reduce(it.production));
+                    // }
                 }
             });
         }

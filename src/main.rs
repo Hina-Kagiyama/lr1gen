@@ -1,4 +1,6 @@
-use lr1gen::lr1::{Table, grammar, n, rule, t};
+use std::{iter::repeat_with, ops::ControlFlow};
+
+use lr1gen::lr1::{Env, Table, grammar, interpret, n, rule, t};
 
 #[allow(dead_code)]
 fn test1() {
@@ -17,7 +19,7 @@ fn test1() {
     // prog:
     //   letExp
     //   prog ; letExp
-    let grm = grammar::<&str, &str>("prog")
+    let grm = grammar::<&str, &str>("prog", "$")
         + rule("primExp", [vec![t("("), n("exp"), t(")")], vec![t("id")]])
         + rule(
             "appExp",
@@ -37,7 +39,10 @@ fn test1() {
         + rule("exp", [vec![n("letExp")]])
         + rule(
             "prog",
-            [vec![n("letExp")], vec![n("prog"), t(";"), n("letExp")]],
+            [
+                vec![n("letExp"), t("$")],
+                vec![n("prog"), t(";"), n("letExp"), t("$")],
+            ],
         );
     let grm = grm.build().unwrap();
 
@@ -57,7 +62,7 @@ fn test2() {
     // primExp ::= ( expr )
     //           | num      // literal “num” token
 
-    let grm = grammar::<&str, &str>("expr")
+    let grm = grammar::<&str, &str>("prog", "$")
         + rule("primExp", [vec![t("("), n("expr"), t(")")], vec![t("num")]])
         + rule(
             "mulExp",
@@ -75,12 +80,27 @@ fn test2() {
                 vec![n("addExp"), t("-"), n("mulExp")],
             ],
         )
-        + rule("expr", [vec![n("addExp"), t("$")]]);
+        + rule("expr", [vec![n("addExp")]])
+        + rule("prog", [vec![n("expr"), t("$")]]);
 
     let grm = grm.build().unwrap();
+    let tbl = Table::make(&grm);
 
     println!("{grm}");
-    println!("{}", Table::make(&grm));
+    println!("{tbl}");
+
+    match repeat_with(|| ()).try_fold(
+        Env::new(["num", "*", "num", "$"].iter().peekable()),
+        |env, _| {
+            let env = interpret(env, &tbl);
+            println!("{env:#?}");
+            env
+        },
+    ) {
+        ControlFlow::Continue(env) => println!("Unfinished parse, env: {env:#?}"),
+        ControlFlow::Break(Ok(ans)) => println!("Finished parse, ans: {ans:#?}"),
+        ControlFlow::Break(Err(env)) => println!("Error in parsing, env: {env:#?}"),
+    }
 }
 
 fn main() {
