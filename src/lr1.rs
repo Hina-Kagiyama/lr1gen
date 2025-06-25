@@ -1,4 +1,6 @@
-use itertools::merge;
+const TAB: &str = "    ";
+
+use itertools::{Itertools, merge};
 use std::{
     collections::{HashMap, hash_map::Entry},
     fmt::Display,
@@ -7,8 +9,6 @@ use std::{
     ops::{Add, ControlFlow},
     usize,
 };
-
-use itertools::Itertools;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Symbol<Terminal, NonTerminal> {
@@ -37,6 +37,46 @@ pub struct Grammar<Terminal, NonTerminal> {
     productions: HashMap<NonTerminalId, Vec<Rhs<TerminalId, NonTerminalId>>>,
     terminals: Vec<Terminal>,
     nonterminals: Vec<NonTerminal>,
+}
+
+impl<Terminal: ToString, NonTerminal> Grammar<Terminal, NonTerminal> {
+    pub fn dump_terminals(&self) -> String {
+        "char *TERMINALS[] = [\n".to_string()
+            + self
+                .terminals
+                .iter()
+                .enumerate()
+                .map(|(i, x)| {
+                    format!(
+                        "{TAB}/* {i:4} */ \"{}\"",
+                        x.to_string().escape_default().collect::<String>().as_str()
+                    )
+                })
+                .collect_vec()
+                .join(",\n")
+                .as_str()
+            + "\n];\n"
+    }
+}
+
+impl<Terminal, NonTerminal: ToString> Grammar<Terminal, NonTerminal> {
+    pub fn dump_non_terminals(&self) -> String {
+        "char *NON_TERMINALS[] = [\n".to_string()
+            + self
+                .nonterminals
+                .iter()
+                .enumerate()
+                .map(|(i, x)| {
+                    format!(
+                        "{TAB}/* {i:3} */ \"{}\"",
+                        x.to_string().escape_default().collect::<String>().as_str()
+                    )
+                })
+                .collect_vec()
+                .join(",\n")
+                .as_str()
+            + "\n];\n"
+    }
 }
 
 impl<Terminal, NonTerminal: Clone> Grammar<Terminal, NonTerminal> {
@@ -353,10 +393,70 @@ pub fn interpret<
     }
 }
 
+impl<'grammar, Terminal: ToString, NonTerminal: ToString> Table<'grammar, Terminal, NonTerminal> {
+    pub fn c_code(&self) -> String {
+        format!("struct token_t advance(void);\nuint64_t parse() {{\n{TAB}static uint64_t lookahead;\n{TAB}") +
+        self.states
+            .iter()
+            .enumerate()
+            .map(|(idx, state)| {
+                let states_switch = format!(
+                    "state_{idx}:\n{TAB}switch (lookahead) {{\n{TAB}{TAB}{}\n{TAB}{TAB}default: return {idx};\n{TAB}}}\n",
+                    state
+                        .action
+                        .iter()
+                        .map(|(lookahead, action)| {
+                            format!(
+                                "case {lookahead}: {}; break;",
+                                match action {
+                                    Action::Shift(s) => format!("g[top] = &goto_{s}; s[top] = datum(lookahead); ++top; advance(); goto state_{s}"),
+                                    Action::Reduce((lhs, rhs)) => format!(
+                                        "reduce_with_rule(\"{lhs}:{rhs}: {} → {}\")",
+                                        self.grammar.nonterminals[*lhs].to_string(),
+                                        self.grammar.productions[lhs][*rhs]
+                                            .iter()
+                                            .map(|sym| match *sym {
+                                                Symbol::Terminal(t) =>
+                                                    self.grammar.terminals[t].to_string(),
+                                                Symbol::NonTerminal(nt) =>
+                                                    self.grammar.nonterminals[nt].to_string(),
+                                                Symbol::Epsilon => "ε".into(),
+                                            })
+                                            .join(" ")
+                                    ),
+                                    Action::Error => panic!("not possible"),
+                                }
+                            )
+                        })
+                        .collect_vec()
+                        .join(format!("\n{TAB}{TAB}").as_str()))
+                    ;
+                    let goto_switch = if state.goto.len() == 0 {
+                    format!("goto_{idx}: return {idx};")
+                } else{format!("goto_{idx}:\n{TAB}switch (lookahead) {{\n{TAB}{TAB}{}\n{TAB}{TAB}default: return {idx};\n{TAB}}}",
+                    state
+                        .goto
+                        .iter()
+                        .map(|(lookahead, target)| {
+                            format!(
+                                "case {lookahead}: goto state_{target}; break;",
+                            )
+                        })
+                        .collect_vec()
+                        .join(format!("\n{TAB}{TAB}").as_str())
+                )};
+                states_switch + goto_switch.as_str()
+                
+            })
+            .collect_vec()
+            .join("\n").as_str() + "\n}"
+    }
+}
+
 impl<'grammar, Terminal, NonTerminal> Display for Table<'grammar, Terminal, NonTerminal>
 where
-    Terminal: Display,
-    NonTerminal: Display,
+    Terminal: ToString,
+    NonTerminal: ToString,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         //------------------------------------------------------------------
@@ -364,8 +464,8 @@ where
         //------------------------------------------------------------------
         let sym_to_string = |sym: &Symbol<TerminalId, NonTerminalId>| -> String {
             match *sym {
-                Symbol::Terminal(t) => format!("{}", self.grammar.terminals[t]),
-                Symbol::NonTerminal(nt) => format!("{}", self.grammar.nonterminals[nt]),
+                Symbol::Terminal(t) => self.grammar.terminals[t].to_string(),
+                Symbol::NonTerminal(nt) => self.grammar.nonterminals[nt].to_string(),
                 Symbol::Epsilon => "ε".into(),
             }
         };
@@ -373,7 +473,7 @@ where
         let item_to_string = |item: &Item| -> String {
             let (lhs, rhs_id) = item.production;
             let rhs = &self.grammar.productions[&lhs][rhs_id];
-            let lhs_str = format!("{}", self.grammar.nonterminals[lhs]);
+            let lhs_str = self.grammar.nonterminals[lhs].to_string();
 
             // RHS with the • at `dot_position`
             let mut rhs_repr: Vec<String> = rhs
@@ -397,7 +497,7 @@ where
                 "{} → {} , {}",
                 lhs_str,
                 rhs_repr.join(" "),
-                self.grammar.terminals[item.lookhead] // look-ahead
+                self.grammar.terminals[item.lookhead].to_string() // look-ahead
             )
         };
 
@@ -406,7 +506,7 @@ where
                 Action::Shift(sid) => format!("Shift({})", sid),
                 Action::Reduce((lhs, rid)) => format!(
                     "Reduce({} → {})",
-                    self.grammar.nonterminals[lhs],
+                    self.grammar.nonterminals[lhs].to_string(),
                     self.grammar.productions[&lhs][rid]
                         .iter()
                         .map(&sym_to_string)
@@ -438,7 +538,7 @@ where
                     writeln!(
                         f,
                         "    {:>10}  →  {}",
-                        self.grammar.terminals[tid],
+                        self.grammar.terminals[tid].to_string(),
                         action_to_string(act)
                     )?;
                 }
@@ -450,7 +550,12 @@ where
                 let mut gts: Vec<_> = state.goto.iter().collect();
                 gts.sort_by_key(|(ntid, _)| *ntid);
                 for (&ntid, &dst) in gts {
-                    writeln!(f, "    {:>10}  →  {}", self.grammar.nonterminals[ntid], dst)?;
+                    writeln!(
+                        f,
+                        "    {:>10}  →  {}",
+                        self.grammar.nonterminals[ntid].to_string(),
+                        dst
+                    )?;
                 }
             }
 
